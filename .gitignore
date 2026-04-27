@@ -7,3 +7,6 @@ udp_rx.exe
 recv_c/received_files/pdftest.pdf
 recv_c/received_files/1777135995_10mb.txt
 pdftest.pdf
+received/received_files/demodemo.txt
+*.txt
+*.pdf
