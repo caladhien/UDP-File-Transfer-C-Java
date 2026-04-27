@@ -92,7 +92,7 @@
 #define MAX_DATA_PAYLOAD 1400u
 
 // Filename length constraints (for safety and compatibility)
-#define MIN_INIT_FILENAME 8u
+#define MIN_INIT_FILENAME 1u
 #define MAX_INIT_FILENAME 2048u
 
 // MD5 hash is always 16 bytes (128 bits)
@@ -187,6 +187,7 @@ static void md5_transform(uint32_t state[4], const unsigned char block[64]) {
 
     // ===== ROUND 1: 16 steps using function F =====
     // Each line is one MD5 step with specific rotation amounts and constants
+    STEP(F, a, b, c, d, x[0], 7, 0xd76aa478);
     STEP(F, d, a, b, c, x[1], 12, 0xe8c7b756);
     STEP(F, c, d, a, b, x[2], 17, 0x242070db);
     STEP(F, b, c, d, a, x[3], 22, 0xc1bdceee);

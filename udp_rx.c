@@ -83,7 +83,7 @@
 #define MAX_DATA_PAYLOAD 1400u
 
 // Filename length must be at least this long (minimum 8 chars for safety)
-#define MIN_INIT_FILENAME 8u
+#define MIN_INIT_FILENAME 1u
 
 // Filename cannot exceed this length (2048 is reasonable limit)
 #define MAX_INIT_FILENAME 2048u
