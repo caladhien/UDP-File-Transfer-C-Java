@@ -4,7 +4,7 @@ Sender and Receiver Commands For Each Project
 --- Receiver --- 
 + ./udp_rx.exe 9000 ./received 30000
 --- Sender ---
-+ ./udp_tx.exe 127.0.0.1 9000 demodemo.txt <ms>
++ ./udp_tx.exe 127.0.0.1 9000 demodemo.txt <ms> (1 ms required for go)
 
 === Java (Misha)===
 --- Receiver ---
