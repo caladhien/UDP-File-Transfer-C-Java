@@ -50,6 +50,8 @@
     
     // Internet address operations (htons, inet_addr, etc.)
     #include <arpa/inet.h>
+    // IPv6 address structures and constants
+    #include <netinet/in.h>
     // File stat/mode definitions
     #include <sys/stat.h>
     // Socket API
@@ -738,7 +740,7 @@ static int finish_transfer(Session *session, const char *output_dir, double elap
     // ===== PRINT SUCCESS STATISTICS =====
     printf("Transfer complete: %s\n", path);
     printf("File size: %llu bytes\n", (unsigned long long)total);
-    printf("Packets received: %u\n", session->max_seq);
+    printf("Packets received: %u (+ 1 init + 1 final)\n", session->max_seq);
     printf("Elapsed time: %.3f seconds\n", elapsed_sec);
     printf("Transfer rate: %.2f bytes/sec\n", total / (elapsed_sec > 0.001 ? elapsed_sec : 1));
     
@@ -790,10 +792,12 @@ int main(int argc, char **argv) {
 #endif
 
     // ===== CREATE UDP SOCKET =====
-    // AF_INET = IPv4 addresses
-    // SOCK_DGRAM = UDP (datagram) socket (NOT TCP/STREAM)
-    socket_t sock = socket(AF_INET, SOCK_DGRAM, 0);
-    
+    // AF_INET6 with IPV6_V6ONLY=0 gives a dual-stack socket that accepts
+    // both IPv4 (127.0.0.1) and IPv6 (::1) packets on the same port.
+    // This means "localhost" works regardless of whether Go resolves it to
+    // IPv4 or IPv6.
+    socket_t sock = socket(AF_INET6, SOCK_DGRAM, 0);
+
     // Check if socket creation succeeded
 #ifdef _WIN32
     if (sock == INVALID_SOCKET) {
@@ -807,13 +811,17 @@ int main(int argc, char **argv) {
         return 1;  // Failed to create socket
     }
 
+    // Disable IPV6_V6ONLY so IPv4 packets are also received (dual-stack)
+    int v6only = 0;
+    setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&v6only, sizeof(v6only));
+
     // ===== BIND SOCKET TO PORT =====
     // This tells the OS: "Listen for incoming packets on this port"
-    struct sockaddr_in addr;
+    struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));  // Clear the struct
-    addr.sin_family = AF_INET;  // IPv4
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);  // Listen on ALL network interfaces (0.0.0.0)
-    addr.sin_port = htons((uint16_t)listen_port);  // Convert port to network byte order
+    addr.sin6_family = AF_INET6;     // IPv6 (dual-stack)
+    addr.sin6_addr = in6addr_any;    // Listen on all interfaces (:: = IPv4 + IPv6)
+    addr.sin6_port = htons((uint16_t)listen_port);
 
     if (bind(sock, (struct sockaddr *)&addr, (int)sizeof(addr)) != 0) {
         perror("bind");  // Print system error message
@@ -852,7 +860,7 @@ int main(int argc, char **argv) {
     //   2. Timeout expires (incomplete transfer), or
     //   3. An error occurs
     unsigned char buffer[MAX_PACKET_SIZE];  // Buffer to hold incoming packets
-    struct sockaddr_in from;  // Will hold sender's address
+    struct sockaddr_in6 from;  // Will hold sender's address (IPv4 or IPv6)
 #ifdef _WIN32
     int from_len = (int)sizeof(from);
 #else

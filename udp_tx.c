@@ -55,6 +55,8 @@
     #include <arpa/inet.h>
     // File control for non-blocking sockets
     #include <fcntl.h>
+    // Hostname/address resolution (getaddrinfo)
+    #include <netdb.h>
     // Socket API
     #include <sys/socket.h>
     // Time structures and functions
@@ -369,23 +371,22 @@ static const char *basename_from_path(const char *path) {
     return base ? base + 1 : path;
 }
 
-// Parse an IPv4 address string (e.g., "192.168.1.1") into a network address structure
-// Returns 1 if successful, 0 if invalid
-static int parse_ipv4_address(const char *text, struct in_addr *out) {
-#ifdef _WIN32
-    // Windows version: use inet_addr (old but widely available)
-    unsigned long value = inet_addr(text);
-    // inet_addr returns INADDR_NONE for invalid addresses
-    // Special case: "255.255.255.255" returns -1 (0xffffffff) which looks like INADDR_NONE
-    if (value == INADDR_NONE && strcmp(text, "255.255.255.255") != 0) {
-        return 0;  // Invalid address
+// Resolve a hostname or IPv4 address string into a network address structure.
+// Uses getaddrinfo() so it handles both numeric IPs and hostnames like "localhost".
+// Returns 1 if successful, 0 if resolution failed.
+static int resolve_address(const char *text, struct in_addr *out) {
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;       // IPv4 only
+    hints.ai_socktype = SOCK_DGRAM;  // UDP
+
+    if (getaddrinfo(text, NULL, &hints, &res) != 0 || res == NULL) {
+        return 0;  // Resolution failed
     }
-    out->s_addr = value;
-    return 1;  // Success
-#else
-    // Unix/Linux version: use inet_pton (more modern and safer)
-    return inet_pton(AF_INET, text, out) == 1;
-#endif
+
+    *out = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+    return 1;
 }
 
 // Send a complete UDP packet to the destination
@@ -506,9 +507,9 @@ int main(int argc, char **argv) {
     addr.sin_family = AF_INET;  // IPv4
     addr.sin_port = htons((uint16_t)dest_port);  // Convert port to network byte order
     
-    // Parse the destination IP address
-    if (!parse_ipv4_address(dest_ip, &addr.sin_addr)) {
-        fprintf(stderr, "Invalid destination IP address\n");
+    // Resolve the destination host (accepts both IP addresses and hostnames like "localhost")
+    if (!resolve_address(dest_ip, &addr.sin_addr)) {
+        fprintf(stderr, "Could not resolve destination address: %s\n", dest_ip);
         socket_close(sock);
     #ifdef _WIN32
         WSACleanup();

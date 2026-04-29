@@ -6,7 +6,7 @@ Sender and Receiver Commands For Each Project
 --- Sender ---
 + ./udp_tx.exe 127.0.0.1 9000 demodemo.txt <ms>
 
-=== Java (Misha )===
+=== Java (Misha)===
 --- Receiver ---
 + java -cp . UdpFileReceiver 9000 ./received 30000
 --- Sender ---
@@ -21,9 +21,9 @@ NOTE: Go receiver is running in port 9000 repeatedly, unless you taskkill.
 
 === Java (Maven) ===
 --- Receiver ---
-+ java -cp target/udp-1.0-SNAPSHOT.jar udp.project.MainRX 9000
++ java -cp "target/udp-1.0-SNAPSHOT.jar;target/dependency/*" udp.project.MainRX 9000 
 --- Sender ---
-+ java -cp . UdpFileReceiver 9000 ./received 30000
++ java -cp "target/udp-1.0-SNAPSHOT.jar;target/dependency/*" udp.project.MainTX
   host  → 127.0.0.1
   port  → 9000
   delay → <ms>
