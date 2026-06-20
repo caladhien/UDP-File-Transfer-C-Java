@@ -99,6 +99,22 @@
 // Directory where we save received files
 #define RECEIVED_DIR "received_files"
 
+// ========== CONTROL CHANNEL (RX -> TX) CONSTANTS ==========
+// We send these small control packets back to the sender so it can retransmit
+// anything we are missing (NAK) or stop once we have verified the file (COMPLETE).
+#define CTRL_NAK 0u        // "resend these data seqs, then resend the final packet"
+#define CTRL_COMPLETE 1u   // "all data received and MD5 verified, you may stop"
+#define CTRL_ACK 2u        // cumulative ACK: "I have everything below ack_base contiguously"
+
+// Largest number of missing seqs we list inside one NAK packet. We give the seq
+// list the same byte budget as a data packet's payload (MAX_DATA_PAYLOAD), so a
+// NAK datagram (5 + 4*N) stays the same MTU-safe size as a data packet:
+// 1400/4 = 350 seqs -> 5 + 1400 = 1405 bytes.
+#define MAX_NAK_SEQS (MAX_DATA_PAYLOAD / 4u)
+
+// Short socket timeout (ms) so the receive loop wakes up regularly to (re)send NAKs.
+#define CTRL_RECV_TIMEOUT_MS 500
+
 
 // ========== PACKET STRUCTURE DEFINITIONS ==========
 // We use #pragma pack(push, 1) to tell the compiler: DON'T add padding between struct members!
@@ -178,6 +194,13 @@ typedef struct {
     unsigned char final_md5[16]; // MD5 hash sent by the sender (for verification)
     uint8_t have_init;           // Flag: 1 = init packet arrived, 0 = not yet
     uint8_t have_final;          // Flag: 1 = final packet arrived, 0 = not yet
+
+    struct sockaddr_in6 sender;  // Address of the sender (where we send control replies)
+    int sender_len;              // Length of the sender address
+    uint8_t have_sender;         // Flag: 1 = we know the sender's address
+
+    uint32_t ack_base;           // Lowest seq still missing (cumulative ACK point).
+                                 // Everything in 1..ack_base-1 has arrived contiguously.
 } Session;
 
 static uint32_t md5_left_rotate(uint32_t value, uint32_t count) {
@@ -436,6 +459,93 @@ static int ensure_chunks(Session *session) {
         }
     }
     return 0;  // Success
+}
+
+// Advance the cumulative ACK point past every contiguous chunk we now hold.
+// ack_base ends up at the lowest seq we are still missing (or max_seq+1 if none).
+static void advance_ack_base(Session *session) {
+    if (session->chunks == NULL) {
+        return;
+    }
+    if (session->ack_base < 1u) {
+        session->ack_base = 1u;
+    }
+    while (session->ack_base <= session->max_seq && session->chunks[session->ack_base].present) {
+        session->ack_base++;
+    }
+}
+
+// Check whether every data chunk (1..max_seq) has arrived.
+static int all_chunks_present(const Session *session) {
+    if (session->chunks == NULL) {
+        return 0;
+    }
+    for (uint32_t seq = 1; seq <= session->max_seq; ++seq) {
+        if (!session->chunks[seq].present) {
+            return 0;  // Still missing at least one chunk
+        }
+    }
+    return 1;  // All chunks present
+}
+
+// Send a control packet back to the sender.
+//   CTRL_COMPLETE -> empty body, tells the sender to stop.
+//   CTRL_NAK      -> lists up to MAX_NAK_SEQS missing data seqs (count==0 means
+//                    "I have all data, just resend the final/MD5 packet").
+// Matches the ControlHeader wire format used by the sender.
+static void send_control(socket_t sock, const Session *session, uint8_t type) {
+    if (!session->have_sender) {
+        return;  // We don't know where to reply yet
+    }
+
+    unsigned char buf[5u + 4u * MAX_NAK_SEQS];
+    buf[0] = (unsigned char)((session->trans_id >> 8) & 0xffu);
+    buf[1] = (unsigned char)(session->trans_id & 0xffu);
+    buf[2] = type;
+
+    uint16_t count = 0u;
+    if (type == CTRL_NAK && session->chunks != NULL) {
+        // List the missing data sequence numbers (big-endian)
+        for (uint32_t seq = 1; seq <= session->max_seq && count < MAX_NAK_SEQS; ++seq) {
+            if (!session->chunks[seq].present) {
+                size_t base = 5u + (size_t)count * 4u;
+                buf[base] = (unsigned char)((seq >> 24) & 0xffu);
+                buf[base + 1] = (unsigned char)((seq >> 16) & 0xffu);
+                buf[base + 2] = (unsigned char)((seq >> 8) & 0xffu);
+                buf[base + 3] = (unsigned char)(seq & 0xffu);
+                count++;
+            }
+        }
+    }
+
+    buf[3] = (unsigned char)((count >> 8) & 0xffu);
+    buf[4] = (unsigned char)(count & 0xffu);
+
+    size_t len = 5u + (size_t)count * 4u;
+    sendto(sock, (const char *)buf, (int)len, 0,
+           (const struct sockaddr *)&session->sender, (int)session->sender_len);
+}
+
+// Send a cumulative ACK back to the sender. Wire layout:
+//   trans_id(2) | type=CTRL_ACK | count(2)=0 | ack_base(4)   (9 bytes)
+// The ACK both advertises "I support windowing" (sent once on the init packet)
+// and tells a windowed sender how far its window may slide.
+static void send_ack(socket_t sock, const Session *session) {
+    if (!session->have_sender) {
+        return;
+    }
+    unsigned char buf[9];
+    buf[0] = (unsigned char)((session->trans_id >> 8) & 0xffu);
+    buf[1] = (unsigned char)(session->trans_id & 0xffu);
+    buf[2] = (unsigned char)CTRL_ACK;
+    buf[3] = 0u;  // count high byte (no SACK blocks)
+    buf[4] = 0u;  // count low byte
+    buf[5] = (unsigned char)((session->ack_base >> 24) & 0xffu);
+    buf[6] = (unsigned char)((session->ack_base >> 16) & 0xffu);
+    buf[7] = (unsigned char)((session->ack_base >> 8) & 0xffu);
+    buf[8] = (unsigned char)(session->ack_base & 0xffu);
+    sendto(sock, (const char *)buf, 9, 0,
+           (const struct sockaddr *)&session->sender, (int)session->sender_len);
 }
 
 
@@ -754,12 +864,21 @@ static int finish_transfer(Session *session, const char *output_dir, double elap
 // ========== MAIN RECEIVER LOOP ==========
 int main(int argc, char **argv) {
     printf("UDP File Receiver starting...\n");
-    double start_time = now_seconds();
 
     // ===== PARSE COMMAND-LINE ARGUMENTS =====
-    // Usage: udp_rx <listen_port> [output_dir] [idle_timeout_ms]
+    // Usage: udp_rx <listen_port> [output_dir] [idle_timeout_ms] [loop]
+    // A trailing "loop" (or -l/--loop) keeps the receiver running for multiple
+    // transfers instead of exiting after one (Ctrl+C to stop).
+    int loop_mode = 0;
+    if (argc >= 2) {
+        const char *last = argv[argc - 1];
+        if (strcmp(last, "loop") == 0 || strcmp(last, "-l") == 0 || strcmp(last, "--loop") == 0) {
+            loop_mode = 1;
+            argc--;  // hide the flag from the positional parsing below
+        }
+    }
     if (argc < 2 || argc > 4) {
-        fprintf(stderr, "Usage: %s <listen_port> [output_dir] [idle_timeout_ms]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <listen_port> [output_dir] [idle_timeout_ms] [loop]\n", argv[0]);
         return 1;  // Incorrect usage
     }
 
@@ -815,6 +934,22 @@ int main(int argc, char **argv) {
     int v6only = 0;
     setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&v6only, sizeof(v6only));
 
+    // ===== DISABLE WINDOWS SIO_UDP_CONNRESET =====
+    // Now that we send control packets back to the sender, an ICMP "port
+    // unreachable" (e.g. a control packet sent a moment before the peer is ready)
+    // would otherwise make every subsequent recvfrom() fail with WSAECONNRESET
+    // (10054) and spin forever. Disabling this behaviour makes recvfrom() ignore
+    // such ICMP errors and keep waiting normally.
+#ifdef _WIN32
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+    BOOL new_behavior = FALSE;
+    DWORD bytes_returned = 0;
+    WSAIoctl(sock, SIO_UDP_CONNRESET, &new_behavior, sizeof(new_behavior),
+             NULL, 0, &bytes_returned, NULL, NULL);
+#endif
+
     // ===== BIND SOCKET TO PORT =====
     // This tells the OS: "Listen for incoming packets on this port"
     struct sockaddr_in6 addr;
@@ -832,25 +967,21 @@ int main(int argc, char **argv) {
         return 1;  // Failed to bind
     }
 
-    // ===== INITIALIZE SESSION =====
-    // A session represents one file transfer
-    Session session;
-    memset(&session, 0, sizeof(session));  // Clear the struct
-    session.trans_id = 0u;  // No valid session yet
-
     // ===== SET SOCKET TIMEOUT =====
-    // If no packets arrive for idle_timeout_ms milliseconds, recvfrom() will fail with a timeout
-    // This prevents us from hanging forever waiting for a chunk that will never come
+    // We use a SHORT socket timeout (CTRL_RECV_TIMEOUT_MS) so the loop wakes up
+    // regularly to (re)send NAKs for whatever is still missing. The longer
+    // idle_timeout_ms is used as an overall "no progress" deadline: if the sender
+    // goes completely silent for that long, we give up (graceful fallback).
 
 #ifdef _WIN32
     // Windows version: timeout is in milliseconds as a DWORD
-    DWORD timeout = (DWORD)idle_timeout_ms;
+    DWORD timeout = (DWORD)CTRL_RECV_TIMEOUT_MS;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
 #else
     // Unix/Linux version: timeout is a timeval struct (seconds + microseconds)
     struct timeval timeout;
-    timeout.tv_sec = idle_timeout_ms / 1000;  // Whole seconds
-    timeout.tv_usec = (idle_timeout_ms % 1000) * 1000;  // Remainder as microseconds
+    timeout.tv_sec = CTRL_RECV_TIMEOUT_MS / 1000;  // Whole seconds
+    timeout.tv_usec = (CTRL_RECV_TIMEOUT_MS % 1000) * 1000;  // Remainder as microseconds
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 #endif
 
@@ -866,7 +997,17 @@ int main(int argc, char **argv) {
 #else
     socklen_t from_len = (socklen_t)sizeof(from);
 #endif
-    int have_activity = 0;  // Flag: did we receive at least one packet?
+    // ===== OUTER LOOP: one full transfer per iteration =====
+    // In loop mode we reset and keep listening after each transfer; otherwise once.
+    do {
+        // Fresh session state for this transfer
+        Session session;
+        memset(&session, 0, sizeof(session));
+        session.trans_id = 0u;
+
+        double start_time = now_seconds();      // reset to the init time once a transfer begins
+        double last_progress = now_seconds();   // last received packet (for the deadline)
+        double overall_deadline_sec = (double)idle_timeout_ms / 1000.0;
 
     while (1) {
         // Reset from_len for this iteration (some systems require this)
@@ -875,32 +1016,69 @@ int main(int argc, char **argv) {
 #else
         from_len = (socklen_t)sizeof(from);
 #endif
-        
+
         // Wait for a UDP packet to arrive
         // recvfrom() blocks until data arrives or timeout expires
         int received = recvfrom(sock, (char *)buffer, (int)sizeof(buffer), 0, (struct sockaddr *)&from, &from_len);
-        
+
         if (received > 0) {
             // ===== PACKET RECEIVED! =====
-            have_activity = 1;  // Mark that we got at least one packet
-            
+            last_progress = now_seconds();  // Sender is alive, reset the deadline
+
             // Process the packet (returns 0 = ok, -1 = error, ignores bad packets)
             if (handle_packet(&session, buffer, (size_t)received) != 0) {
                 fprintf(stderr, "Receiver error while handling packet\n");
                 break;  // Error occurred, exit loop
             }
-            
-            // Check if we're done (have init + final + all data)
-            if (session.have_init && session.have_final) {
-                // ===== TRANSFER COMPLETE! =====
+
+            // Remember where to send control replies (the sender of the init packet)
+            if (session.have_init && !session.have_sender) {
+                session.sender = from;
+                session.sender_len = (int)from_len;
+                session.have_sender = 1;
+                start_time = now_seconds();  // begin timing the actual transfer
+            }
+
+            // ===== SEND A CUMULATIVE ACK =====
+            // Advance our contiguous-received point and ACK it. The very first ACK
+            // (sent on the init packet) doubles as "I support windowing"; a windowed
+            // sender uses these to slide its window. A non-windowed sender simply
+            // ignores them, so this is safe for every peer.
+            if (session.have_init && session.have_sender) {
+                advance_ack_base(&session);
+                send_ack(sock, &session);
+            }
+
+            // ===== ARE WE DONE? =====
+            // Need init + final + every data chunk to assemble and verify the file.
+            if (session.have_init && session.have_final && all_chunks_present(&session)) {
                 double elapsed = now_seconds() - start_time;  // Calculate elapsed time
                 if (finish_transfer(&session, output_dir, elapsed) != 0) {
-                    break;  // Error during finalization
+                    break;  // Error during finalization (e.g. MD5 mismatch)
                 }
+                // Tell the sender it can stop (best-effort; sent a couple of times in
+                // case the COMPLETE is itself lost).
+                send_control(sock, &session, (uint8_t)CTRL_COMPLETE);
+                send_control(sock, &session, (uint8_t)CTRL_COMPLETE);
                 break;  // Transfer done, exit loop
             }
+
+            // ===== ANSWER THE FINAL "ARE YOU DONE?" PROBE WITH A NAK =====
+            // The sender (re)sends the final packet to ask whether we have everything.
+            // If we don't, answer immediately with a NAK listing the gaps. We trigger
+            // only on the FINAL packet (seq == max_seq+1), never on data packets, so
+            // there is no NAK storm. This drives repair without depending on our own
+            // idle timeout, which the sender's periodic finals would otherwise keep
+            // resetting (a livelock).
+            if (session.have_sender && (size_t)received >= sizeof(DataHeader)) {
+                uint32_t rseq = (uint32_t)buffer[2] << 24 | (uint32_t)buffer[3] << 16 |
+                                (uint32_t)buffer[4] << 8 | (uint32_t)buffer[5];
+                if (session.have_final && rseq == session.max_seq + 1u) {
+                    send_control(sock, &session, (uint8_t)CTRL_NAK);
+                }
+            }
         } else {
-            // ===== RECEIVE FAILED OR TIMED OUT =====
+            // ===== RECEIVE TIMED OUT (no packet within CTRL_RECV_TIMEOUT_MS) =====
 #ifdef _WIN32
             int error_code = WSAGetLastError();
             // Check for timeout (expected) vs other errors (unexpected)
@@ -908,21 +1086,48 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "recvfrom failed with WSA error %d\n", error_code);
             }
 #endif
-            
-            // Print why we're exiting
-            if (have_activity) {
-                // We received some packets, then had a timeout
-                fprintf(stderr, "Transfer timed out before completion.\n");
-            } else {
-                // We never received any packets at all
-                fprintf(stderr, "No packets received.\n");
+            // Drive repair: periodically (re)NAK whatever is still missing so the
+            // sender retransmits it. This also re-requests a lost final packet.
+            if (session.have_init && session.have_sender) {
+                send_control(sock, &session, (uint8_t)CTRL_NAK);
             }
-            break;  // Exit loop
+
+            // Overall deadline measured from the last received packet. If the sender
+            // is silent for longer than idle_timeout_ms, end this transfer attempt.
+            if (now_seconds() - last_progress > overall_deadline_sec) {
+                if (session.have_init && session.have_final && all_chunks_present(&session)) {
+                    // We have everything; assemble, verify, and confirm.
+                    double elapsed = now_seconds() - start_time;
+                    if (finish_transfer(&session, output_dir, elapsed) == 0) {
+                        send_control(sock, &session, (uint8_t)CTRL_COMPLETE);
+                    }
+                    break;
+                }
+                if (session.have_init) {
+                    // A transfer started but stalled (sender went silent mid-transfer).
+                    fprintf(stderr, "Transfer timed out before completion.\n");
+                    break;
+                }
+                // No transfer in progress yet.
+                if (loop_mode) {
+                    last_progress = now_seconds();  // stay up and keep waiting for a sender
+                    continue;
+                }
+                fprintf(stderr, "No packets received.\n");
+                break;
+            }
         }
     }
 
+        // ===== END OF ONE TRANSFER ATTEMPT =====
+        free_session(&session);  // Free this transfer's memory
+        if (loop_mode) {
+            printf("\n--- Ready for the next transfer on port %d (Ctrl+C to stop) ---\n", listen_port);
+            fflush(stdout);  // show progress promptly even when output is redirected
+        }
+    } while (loop_mode);
+
     // ===== CLEANUP =====
-    free_session(&session);  // Free all allocated memory
     socket_close(sock);  // Close the socket
 #ifdef _WIN32
     WSACleanup();  // Clean up Winsock on Windows

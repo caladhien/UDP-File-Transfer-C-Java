@@ -100,6 +100,39 @@
 // MD5 hash is always 16 bytes (128 bits)
 #define MD5_DIGEST_LEN 16u
 
+// ========== CONTROL CHANNEL (RX -> TX) CONSTANTS ==========
+// The receiver sends these small control packets back to us so we can
+// retransmit anything that was lost (NAK) or stop once it has everything (COMPLETE).
+#define CTRL_NAK 0u        // "resend these data seqs, then resend the final packet"
+#define CTRL_COMPLETE 1u   // "all data received and MD5 verified, you may stop"
+#define CTRL_ACK 2u        // cumulative ACK: receiver has everything below ack_base
+
+// ========== SLIDING WINDOW (optional fast path) CONSTANTS ==========
+// If the receiver advertises ACK support (sends an ACK right after the init
+// packet), we switch from "blast then repair" to a Selective-Repeat sliding
+// window driven by those cumulative ACKs plus per-packet retransmit timers.
+#define WINDOW_SIZE 64u            // max data packets in flight (unacked)
+#define RTO_MS 100                 // retransmit timeout for an unacked packet (ms)
+#define WIN_RECV_TIMEOUT_MS 20     // how long we block for an ACK each loop turn
+#define PROBE_TRIES 5              // how many times we re-send init while probing
+#define PROBE_WAIT_MS 150          // wait per probe attempt for the first ACK
+#define WIN_STALL_ABORT_SEC 30.0   // give up if the window makes no progress this long
+
+// Largest number of missing seqs we expect inside one NAK packet. We give the
+// seq list the same byte budget as a data packet's payload (MAX_DATA_PAYLOAD),
+// so a NAK datagram (5 + 4*N) stays the same MTU-safe size as a data packet:
+// 1400/4 = 350 seqs -> 5 + 1400 = 1405 bytes.
+#define MAX_NAK_SEQS (MAX_DATA_PAYLOAD / 4u)
+
+// How long (ms) we wait for a control packet before nudging the receiver.
+#define CTRL_RECV_TIMEOUT_MS 500
+
+// How many idle timeouts we tolerate before assuming the receiver does not
+// speak our control protocol (e.g. an old fire-and-forget / Go receiver) and
+// exiting as the legacy behaviour did. Each control reply resets this budget,
+// so this only bounds CONSECUTIVE silence (10 * 500ms = 5s).
+#define MAX_RETRIES 10u
+
 // ========== PACKET STRUCTURE DEFINITIONS ==========
 // We use #pragma pack(push, 1) to tell the compiler: DON'T add padding!
 // This ensures our binary packets match exactly what the receiver expects
@@ -130,6 +163,17 @@ typedef struct {
     uint32_t seq;       // Sequence number = max_seq + 1 (signals this is final)
     unsigned char md5[16];  // The MD5 hash of the complete file
 } FinalPacket;
+
+// ===== CONTROL PACKET (RX -> TX), sent in reply to verify/repair the transfer =====
+// trans_id : must match this transfer
+// type     : CTRL_NAK or CTRL_COMPLETE
+// count    : number of missing data seqs that follow (NAK only; may be 0)
+// followed by 'count' big-endian uint32_t missing sequence numbers
+typedef struct {
+    uint16_t trans_id;  // Transaction ID of the transfer being controlled
+    uint8_t  type;      // CTRL_NAK (0) or CTRL_COMPLETE (1)
+    uint16_t count;     // Number of missing seqs that follow (NAK only)
+} ControlHeader;
 
 // Resume normal struct padding rules from here on
 #pragma pack(pop)
@@ -401,6 +445,291 @@ static int send_all_packet(socket_t sock, const struct sockaddr_in *addr, const 
     return sent == (int)length ? 0 : -1;
 }
 
+// Build and send a single data packet for the given sequence number by reading
+// the matching chunk straight from the file. Used for retransmits requested via
+// a NAK, so we never have to keep the whole file in memory.
+//   trans_id_net : transaction ID already in network byte order
+//   seq          : data sequence number (1 .. max_seq)
+// Returns 0 on success, -1 on failure.
+static int send_data_packet(socket_t sock, const struct sockaddr_in *addr, FILE *file,
+                            uint16_t trans_id_net, uint32_t seq) {
+    unsigned char file_buffer[MAX_DATA_PAYLOAD];
+    unsigned char data_packet[sizeof(DataHeader) + MAX_DATA_PAYLOAD];
+
+    // Each data seq maps to a fixed file offset: chunk (seq-1) of MAX_DATA_PAYLOAD bytes
+    long offset = (long)(seq - 1u) * (long)MAX_DATA_PAYLOAD;
+    if (fseek(file, offset, SEEK_SET) != 0) {
+        return -1;  // Seek failed
+    }
+
+    size_t bytes_read = fread(file_buffer, 1u, MAX_DATA_PAYLOAD, file);
+    if (bytes_read == 0u && ferror(file)) {
+        return -1;  // Read failed
+    }
+
+    DataHeader header;
+    header.trans_id = trans_id_net;
+    header.seq = htonl(seq);
+    memcpy(data_packet, &header, sizeof(header));
+    memcpy(data_packet + sizeof(header), file_buffer, bytes_read);
+
+    return send_all_packet(sock, addr, data_packet, sizeof(header) + bytes_read);
+}
+
+// Set the socket's receive timeout (in milliseconds). Used to interleave sending
+// with non-blocking-ish control reads.
+static void set_recv_timeout(socket_t sock, int ms) {
+#ifdef _WIN32
+    DWORD to = (DWORD)ms;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
+#else
+    struct timeval to;
+    to.tv_sec = ms / 1000;
+    to.tv_usec = (ms % 1000) * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+#endif
+}
+
+// Read the DROP_PCT test knob (0-100); see the send loops for what it does.
+static int get_drop_pct(void) {
+    const char *env = getenv("DROP_PCT");
+    if (env == NULL) {
+        return 0;
+    }
+    int v = atoi(env);
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    return v;
+}
+
+// Probe whether the receiver supports windowing. A windowing-capable receiver
+// sends a cumulative ACK as soon as it gets the init packet. We re-send init a
+// few times (so a lost init still gets through) and watch for that first ACK.
+// Returns 1 if an ACK was seen (use the sliding window), 0 otherwise (fall back
+// to the legacy blast + NAK-rounds path).
+static int probe_ack(socket_t sock, const struct sockaddr_in *addr, uint16_t trans_id,
+                     const unsigned char *init_packet, size_t init_len) {
+    set_recv_timeout(sock, PROBE_WAIT_MS);
+    unsigned char buf[64];
+    for (int attempt = 0; attempt < PROBE_TRIES; ++attempt) {
+        struct sockaddr_in from;
+#ifdef _WIN32
+        int from_len = (int)sizeof(from);
+#else
+        socklen_t from_len = (socklen_t)sizeof(from);
+#endif
+        int r = recvfrom(sock, (char *)buf, (int)sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
+        if (r >= 5) {
+            uint16_t tr = (uint16_t)((buf[0] << 8) | buf[1]);
+            if (tr == trans_id && buf[2] == (unsigned char)CTRL_ACK) {
+                return 1;  // Receiver speaks ACK -> use the window
+            }
+        } else {
+            // Timed out: re-send init in case it (or the ACK) was lost.
+            send_all_packet(sock, addr, init_packet, init_len);
+        }
+    }
+    return 0;  // No ACK seen -> legacy receiver
+}
+
+// Resend one already-sent unit: a data packet, or the final packet when
+// seq == max_seq+1. Used by the window's RTO and NAK handling.
+static int resend_unit(socket_t sock, const struct sockaddr_in *addr, FILE *file,
+                       uint16_t trans_id_net, uint32_t seq, uint32_t max_seq,
+                       const FinalPacket *final_packet) {
+    if (seq <= max_seq) {
+        return send_data_packet(sock, addr, file, trans_id_net, seq);
+    }
+    return send_all_packet(sock, addr, (const unsigned char *)final_packet, sizeof(*final_packet));
+}
+
+// ========== SLIDING-WINDOW SEND ==========
+// Selective Repeat: keep up to WINDOW_SIZE data packets in flight, slide the
+// window forward as cumulative ACKs arrive, and retransmit any unit whose RTO
+// expires. MD5 is computed over the first send of each chunk. Returns 0 if the
+// receiver confirmed COMPLETE, -1 if it stalled.
+static int windowed_send(socket_t sock, const struct sockaddr_in *addr, FILE *file,
+                         uint16_t trans_id, uint16_t trans_id_net, uint32_t max_seq,
+                         uint64_t file_size, uint64_t *bytes_sent, double start_time) {
+    printf("Mode: sliding window (receiver supports ACK), window=%u\n", (unsigned)WINDOW_SIZE);
+
+    // Per-unit last-send time (index 1..max_seq for data, max_seq+1 for final).
+    double *send_time = calloc((size_t)max_seq + 2u, sizeof(double));
+    if (send_time == NULL) {
+        fprintf(stderr, "windowed: out of memory for timers\n");
+        return -1;
+    }
+
+    const int drop_pct = get_drop_pct();
+    uint32_t dropped = 0u, retransmitted = 0u;
+
+    MD5_CTX md5;
+    md5_init(&md5);
+    unsigned char chunk[MAX_DATA_PAYLOAD];
+    unsigned char data_packet[sizeof(DataHeader) + MAX_DATA_PAYLOAD];
+    DataHeader data_header;
+    data_header.trans_id = trans_id_net;
+
+    FinalPacket final_packet;
+    unsigned char digest[MD5_DIGEST_LEN];
+    int final_built = 0, final_sent = 0, complete = 0;
+
+    uint32_t base = 1u;      // oldest unacked seq
+    uint32_t next_seq = 1u;  // next new seq to send for the first time
+    double progress_at = now_seconds();
+    int dup_acks = 0;        // count of duplicate ACKs at the current base
+    int fast_done = 0;       // already fast-retransmitted for this base?
+
+    set_recv_timeout(sock, WIN_RECV_TIMEOUT_MS);
+
+    while (1) {
+        // ===== FILL THE WINDOW WITH NEW DATA =====
+        while (next_seq <= max_seq && next_seq < base + WINDOW_SIZE) {
+            if (fseek(file, (long)(next_seq - 1u) * (long)MAX_DATA_PAYLOAD, SEEK_SET) != 0) {
+                free(send_time);
+                return -1;
+            }
+            size_t br = fread(chunk, 1u, MAX_DATA_PAYLOAD, file);
+            if (br == 0u && ferror(file)) {
+                free(send_time);
+                return -1;
+            }
+            md5_update(&md5, chunk, br);  // hash on first send only
+
+            data_header.seq = htonl(next_seq);
+            memcpy(data_packet, &data_header, sizeof(data_header));
+            memcpy(data_packet + sizeof(data_header), chunk, br);
+
+            if (drop_pct > 0 && (rand() % 100) < drop_pct) {
+                dropped++;  // simulate first-pass loss; RTO/ACK will repair it
+            } else if (send_all_packet(sock, addr, data_packet, sizeof(data_header) + br) == 0) {
+                *bytes_sent += (uint64_t)(sizeof(data_header) + br);
+            }
+            send_time[next_seq] = now_seconds();
+            next_seq++;
+        }
+
+        // ===== BUILD AND SEND THE FINAL PACKET ONCE ALL DATA IS HASHED =====
+        if (next_seq > max_seq && !final_built) {
+            md5_final(&md5, digest);
+            final_packet.trans_id = trans_id_net;
+            final_packet.seq = htonl(max_seq + 1u);
+            memcpy(final_packet.md5, digest, sizeof(final_packet.md5));
+            final_built = 1;
+        }
+        if (final_built && !final_sent) {
+            if (send_all_packet(sock, addr, (const unsigned char *)&final_packet, sizeof(final_packet)) == 0) {
+                *bytes_sent += (uint64_t)sizeof(final_packet);
+            }
+            send_time[max_seq + 1u] = now_seconds();
+            final_sent = 1;
+        }
+
+        // ===== RECEIVE A CONTROL PACKET =====
+        unsigned char cb[5u + 4u * MAX_NAK_SEQS];
+        struct sockaddr_in cf;
+#ifdef _WIN32
+        int cfl = (int)sizeof(cf);
+#else
+        socklen_t cfl = (socklen_t)sizeof(cf);
+#endif
+        int r = recvfrom(sock, (char *)cb, (int)sizeof(cb), 0, (struct sockaddr *)&cf, &cfl);
+        if (r >= 5) {
+            uint16_t tr = (uint16_t)((cb[0] << 8) | cb[1]);
+            if (tr == trans_id) {
+                uint8_t type = cb[2];
+                if (type == CTRL_COMPLETE) {
+                    complete = 1;
+                    break;
+                } else if (type == CTRL_ACK && r >= 9) {
+                    uint32_t ack_base = (uint32_t)cb[5] << 24 | (uint32_t)cb[6] << 16 |
+                                        (uint32_t)cb[7] << 8 | (uint32_t)cb[8];
+                    if (ack_base > base) {
+                        base = ack_base;            // slide the window forward
+                        progress_at = now_seconds();
+                        dup_acks = 0;
+                        fast_done = 0;
+                    } else if (ack_base == base) {
+                        // Duplicate ACK: the receiver is stuck waiting for `base`.
+                        // After 3 of them, fast-retransmit base once (don't wait for RTO).
+                        if (++dup_acks >= 3 && !fast_done && base <= max_seq + 1u) {
+                            if (resend_unit(sock, addr, file, trans_id_net, base, max_seq, &final_packet) == 0) {
+                                retransmitted++;
+                            }
+                            send_time[base] = now_seconds();
+                            fast_done = 1;
+                        }
+                    }
+                } else if (type == CTRL_NAK) {
+                    uint16_t count = (uint16_t)((cb[3] << 8) | cb[4]);
+                    if ((size_t)r < 5u + 4u * (size_t)count) {
+                        count = (uint16_t)((r - 5) / 4);
+                    }
+                    for (uint16_t i = 0; i < count; ++i) {
+                        size_t b = 5u + (size_t)i * 4u;
+                        uint32_t s = (uint32_t)cb[b] << 24 | (uint32_t)cb[b + 1] << 16 |
+                                     (uint32_t)cb[b + 2] << 8 | (uint32_t)cb[b + 3];
+                        if (s >= 1u && s <= max_seq) {
+                            if (resend_unit(sock, addr, file, trans_id_net, s, max_seq, &final_packet) == 0) {
+                                retransmitted++;
+                            }
+                            send_time[s] = now_seconds();
+                        }
+                    }
+                    if (final_built) {
+                        send_all_packet(sock, addr, (const unsigned char *)&final_packet, sizeof(final_packet));
+                    }
+                }
+            }
+        }
+
+        // ===== RETRANSMIT ON RTO (backstop) =====
+        // Only the oldest unacked unit (base) is timed out and resent here; the
+        // window slides as its ACK arrives, exposing the next unacked unit. Fast
+        // retransmit (above) handles the common case; this covers a lost retransmit.
+        double now = now_seconds();
+        uint32_t upto = final_sent ? (max_seq + 1u) : (next_seq > 1u ? next_seq - 1u : 1u);
+        if (base <= upto && send_time[base] > 0.0 && (now - send_time[base]) > (double)RTO_MS / 1000.0) {
+            if (resend_unit(sock, addr, file, trans_id_net, base, max_seq, &final_packet) == 0) {
+                retransmitted++;
+            }
+            send_time[base] = now;
+            fast_done = 0;  // allow another fast retransmit if duplicates keep coming
+        }
+
+        // ===== STALL GUARD =====
+        if (now_seconds() - progress_at > WIN_STALL_ABORT_SEC) {
+            fprintf(stderr, "windowed: no progress for %.0fs, aborting.\n", WIN_STALL_ABORT_SEC);
+            break;
+        }
+    }
+
+    free(send_time);
+
+    // ===== SUMMARY =====
+    double elapsed = now_seconds() - start_time;
+    if (elapsed <= 0.0) elapsed = 0.001;
+    if (dropped > 0u) {
+        printf("Simulated loss: dropped %u data packets on first pass (DROP_PCT=%d)\n", dropped, drop_pct);
+    }
+    if (retransmitted > 0u) {
+        printf("Retransmitted %u packet(s) (window RTO/NAK).\n", retransmitted);
+    }
+    if (complete) {
+        printf("Receiver confirmed transfer COMPLETE (ACK/window).\n");
+    } else {
+        printf("Windowed transfer ended without COMPLETE.\n");
+    }
+    if (final_built) {
+        printf("Transfer sent successfully!\nFile MD5 hash: ");
+        print_md5_hex(digest);
+    }
+    printf("Total bytes sent (including protocol headers): %llu\n", (unsigned long long)*bytes_sent);
+    printf("Elapsed time: %.3f seconds\n", elapsed);
+    printf("Average throughput: %.2f bytes/sec\n", (double)file_size / elapsed);
+    return complete ? 0 : -1;
+}
+
 // ========== MAIN UDP FILE SENDER LOOP ==========
 int main(int argc, char **argv) {
     // ===== PARSE COMMAND-LINE ARGUMENTS =====
@@ -501,6 +830,20 @@ int main(int argc, char **argv) {
         return 1;  // Failed to create socket
     }
 
+    // ===== DISABLE WINDOWS SIO_UDP_CONNRESET =====
+    // We now recvfrom() control packets on this socket. Without this, an ICMP
+    // "port unreachable" from a peer that isn't listening would make recvfrom()
+    // fail with WSAECONNRESET (10054) and spin instead of timing out cleanly.
+#ifdef _WIN32
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+    BOOL new_behavior = FALSE;
+    DWORD bytes_returned = 0;
+    WSAIoctl(sock, SIO_UDP_CONNRESET, &new_behavior, sizeof(new_behavior),
+             NULL, 0, &bytes_returned, NULL, NULL);
+#endif
+
     // ===== SET UP DESTINATION ADDRESS =====
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));  // Clear the struct
@@ -552,10 +895,41 @@ int main(int argc, char **argv) {
     bytes_sent += (uint64_t)(sizeof(init_header) + filename_len);
     rate_limit_send(pace_ms);
 
+    // ===== TRY THE SLIDING-WINDOW FAST PATH =====
+    // Probe whether the receiver supports ACK-based windowing (it sends an ACK on
+    // the init packet). If so, run the windowed sender and finish here; otherwise
+    // fall through to the legacy blast + NAK-rounds path, which also works against
+    // non-ACK / fire-and-forget receivers.
+    if (probe_ack(sock, &addr, trans_id, init_packet, sizeof(init_header) + filename_len)) {
+        int wrc = windowed_send(sock, &addr, file, trans_id, init_header.trans_id,
+                                max_seq, file_size, &bytes_sent, start_time);
+        socket_close(sock);
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        fclose(file);
+        return wrc == 0 ? 0 : 1;
+    }
+    printf("Mode: legacy blast + NAK repair (receiver did not advertise ACK)\n");
+
     unsigned char file_buffer[MAX_DATA_PAYLOAD];
     unsigned char data_packet[sizeof(DataHeader) + MAX_DATA_PAYLOAD];
     DataHeader data_header;
     data_header.trans_id = htons(trans_id);
+
+    // ===== TEST KNOB: SIMULATE PACKET LOSS =====
+    // Set the DROP_PCT environment variable (0-100) to randomly skip sending some
+    // data packets on this FIRST pass only. Retransmits are never dropped, so the
+    // receiver's NAKs still let the transfer converge. Used to prove the ACK/NAK
+    // repair loop works end-to-end. Defaults to 0 (no loss).
+    int drop_pct = 0;
+    const char *drop_env = getenv("DROP_PCT");
+    if (drop_env != NULL) {
+        drop_pct = atoi(drop_env);
+        if (drop_pct < 0) drop_pct = 0;
+        if (drop_pct > 100) drop_pct = 100;
+    }
+    uint32_t dropped_count = 0u;
 
     // ===== CORE FIRE-AND-FORGET SEND LOOP =====
     // UDP has NO delivery guarantee + NO ACKs + NO congestion control
@@ -590,17 +964,22 @@ int main(int argc, char **argv) {
         memcpy(data_packet + sizeof(data_header), file_buffer, bytes_read);
 
         // ===== SEND DATA PACKET =====
-        // sendto() to the destination address
-        if (send_all_packet(sock, &addr, data_packet, sizeof(data_header) + bytes_read) != 0) {
-            perror("sendto(data)");
-            socket_close(sock);
+        // Optionally drop this packet to simulate loss (DROP_PCT test knob).
+        if (drop_pct > 0 && (rand() % 100) < drop_pct) {
+            dropped_count++;  // Pretend it was lost in transit; receiver will NAK it
+        } else {
+            // sendto() to the destination address
+            if (send_all_packet(sock, &addr, data_packet, sizeof(data_header) + bytes_read) != 0) {
+                perror("sendto(data)");
+                socket_close(sock);
 #ifdef _WIN32
-            WSACleanup();
+                WSACleanup();
 #endif
-            fclose(file);
-            return 1;  // Failed to send data packet
+                fclose(file);
+                return 1;  // Failed to send data packet
+            }
+            bytes_sent += (uint64_t)(sizeof(data_header) + bytes_read);
         }
-        bytes_sent += (uint64_t)(sizeof(data_header) + bytes_read);
         
         // ===== RATE LIMITING =====
         // UDP has no backpressure mechanisms, so without rate-limiting,
@@ -639,8 +1018,99 @@ int main(int argc, char **argv) {
         return 1;  // Failed to send final packet
     }
     bytes_sent += (uint64_t)sizeof(final_packet);
+    if (dropped_count > 0u) {
+        printf("Simulated loss: dropped %u of %u data packets on first pass (DROP_PCT=%d)\n",
+               dropped_count, max_seq, drop_pct);
+    }
+
+    // ===== CONTROL LOOP: WAIT FOR ACK/NAK FROM RECEIVER =====
+    // Now that the whole file has been blasted out, switch to a request/repair phase:
+    // the receiver replies with NAKs listing whatever it is still missing, and we
+    // retransmit those packets until it confirms COMPLETE. If the receiver never
+    // answers (e.g. an old fire-and-forget / Go receiver), we fall back to the
+    // legacy behaviour after MAX_RETRIES idle timeouts and exit successfully.
+#ifdef _WIN32
+    DWORD ctl_timeout = (DWORD)CTRL_RECV_TIMEOUT_MS;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&ctl_timeout, sizeof(ctl_timeout));
+#else
+    struct timeval ctl_timeout;
+    ctl_timeout.tv_sec = CTRL_RECV_TIMEOUT_MS / 1000;
+    ctl_timeout.tv_usec = (CTRL_RECV_TIMEOUT_MS % 1000) * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &ctl_timeout, sizeof(ctl_timeout));
+#endif
+
+    unsigned char ctl_buf[5u + 4u * MAX_NAK_SEQS];
+    uint32_t retries_left = MAX_RETRIES;
+    int complete = 0;
+    uint32_t retransmitted = 0u;
+
+    while (retries_left > 0u) {
+        struct sockaddr_in ctl_from;
+#ifdef _WIN32
+        int ctl_from_len = (int)sizeof(ctl_from);
+#else
+        socklen_t ctl_from_len = (socklen_t)sizeof(ctl_from);
+#endif
+        int r = recvfrom(sock, (char *)ctl_buf, (int)sizeof(ctl_buf), 0,
+                         (struct sockaddr *)&ctl_from, &ctl_from_len);
+
+        if (r < 0) {
+            // Timed out waiting for a control packet: nudge the receiver by
+            // resending the final packet, then count down the retry budget.
+            send_all_packet(sock, &addr, (const unsigned char *)&final_packet, sizeof(final_packet));
+            retries_left--;
+            continue;
+        }
+
+        // Need at least the 5-byte control header
+        if (r < 5) {
+            continue;
+        }
+
+        // Parse the big-endian control header (matches ControlHeader layout)
+        uint16_t ctl_trans = (uint16_t)((ctl_buf[0] << 8) | ctl_buf[1]);
+        if (ctl_trans != trans_id) {
+            continue;  // Stale/foreign control packet, ignore
+        }
+        uint8_t ctl_type = ctl_buf[2];
+
+        if (ctl_type == CTRL_COMPLETE) {
+            complete = 1;
+            break;  // Receiver has everything and verified the MD5
+        }
+
+        if (ctl_type == CTRL_NAK) {
+            uint16_t count = (uint16_t)((ctl_buf[3] << 8) | ctl_buf[4]);
+            // Clamp count to whatever actually fit in the datagram
+            if ((size_t)r < 5u + 4u * (size_t)count) {
+                count = (uint16_t)((r - 5) / 4);
+            }
+            for (uint16_t i = 0; i < count; ++i) {
+                size_t base = 5u + (size_t)i * 4u;
+                uint32_t s = (uint32_t)ctl_buf[base] << 24 | (uint32_t)ctl_buf[base + 1] << 16 |
+                             (uint32_t)ctl_buf[base + 2] << 8 | (uint32_t)ctl_buf[base + 3];
+                if (s >= 1u && s <= max_seq) {
+                    if (send_data_packet(sock, &addr, file, init_header.trans_id, s) == 0) {
+                        retransmitted++;
+                    }
+                }
+            }
+            // Always resend the final packet so the receiver can re-verify
+            send_all_packet(sock, &addr, (const unsigned char *)&final_packet, sizeof(final_packet));
+            retries_left = MAX_RETRIES;  // Got a live reply, refill the budget
+        }
+    }
+
+    if (retransmitted > 0u) {
+        printf("Retransmitted %u packet(s) in response to NAKs.\n", retransmitted);
+    }
 
     // ===== PRINT TRANSFER COMPLETION SUMMARY =====
+    if (complete) {
+        printf("Receiver confirmed transfer COMPLETE (ACK received).\n");
+    } else {
+        printf("No ACK received; assuming fire-and-forget receiver and exiting.\n");
+    }
     printf("Transfer sent successfully!\n");
     printf("File MD5 hash: ");
     print_md5_hex(digest);  // Print the 16-byte hash as hex

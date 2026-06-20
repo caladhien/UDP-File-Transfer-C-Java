@@ -10,3 +10,5 @@ pdftest.pdf
 received/received_files/demodemo.txt
 *.txt
 *.pdf
+test.bin
+test.ps1
