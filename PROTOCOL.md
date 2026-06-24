@@ -1,21 +1,20 @@
 # How our UDP file transfer talks to itself
 
-Hey team — this is the shared contract so all four of our sender/receiver combos
+Hey team, this is the shared protocol so all four of our sender/receiver combos
 actually work together. If your bytes match what's in here, your program will talk to
-mine (and everyone else's) no matter the language.
+mine no matter the language.
 
 Quick mental model: the **data packets** (the file itself) are already the same for all
-of us — that's why a basic transfer has always worked across languages. The new part is
+of us, that's why a basic transfer has always worked across languages. The new part is
 the little **control messages** the receiver sends back. Those are what make a transfer
-survive packet loss and run fast. You don't strictly *need* them for a clean-network
-demo, but you do need them for the "fehlerfrei" requirement, and they have to match.
+survive packet loss and run fast. 
 
 Everything on the wire is **big-endian** (network byte order). If you forget that, things
 break in really confusing ways, so double-check it first.
 
 ## The data packets (sender → receiver)
 
-There's no "type" field — which packet it is comes from the **sequence number**:
+There's no "type" field , which packet it is comes from the **sequence number**:
 
 - **Init** (`seq = 0`): `trans_id(2) | seq(4)=0 | max_seq(4) | filename(1..2048)`
   Kicks things off: a random `trans_id` for the session, `max_seq` = how many data
@@ -24,11 +23,11 @@ There's no "type" field — which packet it is comes from the **sequence number*
 - **Final** (`seq = max_seq + 1`): `trans_id(2) | seq(4) | md5(16)`
   The 16-byte MD5 of the whole file so the receiver can verify it.
 
-A couple of things that will bite you if you get them wrong:
+A couple of things that will bite us if you get them wrong:
 
 - **Payload is max 1400 bytes. Use exactly 1400 everywhere.** I literally lost an hour to
-  this — one of our files had it at 1450 and the receiver silently rejected every single
-  data packet. `max_seq` is just `ceil(filesize / 1400)`.
+  this, one of my files had it at 1450 and the receiver rejected every single
+  data packet lol. `max_seq` is just `ceil(filesize / 1400)`.
 - UDP can deliver packets **out of order**, so the receiver has to stash data packets by
   their sequence number and reassemble at the end, not just append as they arrive.
 
@@ -56,7 +55,7 @@ On the **receiver** side —
   sender "I speak the control protocol," which is how it decides to turn on windowing.
 - Keep sending a cumulative ACK as data comes in.
 - When the **final** packet shows up but you're still missing data, reply with a NAK
-  listing the gaps. Do this **only in response to the final packet** — don't fire a NAK
+  listing the gaps. Do this **only in response to the final packet** , don't fire a NAK
   for every data packet you receive. I tried that and it caused a nasty retransmit storm,
   plus a livelock where the sender's repeated finals kept resetting my timer so I never
   actually NAK'd. Answering the final is the sweet spot.
@@ -71,13 +70,13 @@ On the **sender** side —
 
 ## Stuff you can do however you like
 
-Window size, retransmit timeout, socket timeouts, retry counts — all of that is your own
+Window size, retransmit timeout, socket timeouts, retry counts, all of that is your own
 call and doesn't need to match anyone. Mine happen to be a window of 64 and a 100 ms RTO,
 but pick whatever works for you.
 
 ## If you don't implement the control messages yet
 
-No drama — it still works, just in a reduced way. My sender will probe, get no ACK, and
+No problem, it still works, just in a reduced way. My sender will probe, get no ACK, and
 drop back to the simple path; my receiver will still answer NAK/COMPLETE and send ACKs
 you can ignore. So a basic transfer goes through fine. The catch is that **lost packets
 only get repaired when both sides speak the control protocol**, so a clean network is
@@ -87,14 +86,14 @@ fine but a lossy one needs both ends on board. Either way nothing hangs.
 
 - **If you're on Windows:** turn off `SIO_UDP_CONNRESET` on your UDP socket right after you
   create it. Otherwise a single ICMP "port unreachable" makes every later `recvfrom` blow
-  up with error 10054 and the socket basically spins. One `WSAIoctl` call fixes it.
+  up with error 10054 and the socket basically spins. One `WSAIoctl` call fixes it. (Probably, but test this for yourself first.)
 - **Big-endian, everywhere, including the control packets.** Easy to remember for the data
-  side and then forget for the ACK — that's the sneaky one.
+  side and then forget for the ACK.
 
 ## When you test
 
-Please test your program against mine **both directions** — your sender to my receiver and
-my sender to your receiver — not just your own pair. Throw some packet loss at it (drop a
+Please test your program against mine **both directions**, your sender to my receiver and
+my sender to your receiver, not just your own pair. Throw some packet loss at it (drop a
 chunk of the data packets) and confirm the received file's MD5 still matches the original.
 And check that it behaves when the other side doesn't talk back, so nobody ends up hanging
 during the live demo.

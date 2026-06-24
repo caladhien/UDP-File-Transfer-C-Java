@@ -12,3 +12,9 @@ received/received_files/demodemo.txt
 *.pdf
 test.bin
 test.ps1
+.vscode/bookmarks.json
+.vscode/settings.json
+PROTOCOL.md
+received/received_files/payload.bin
+PROTOCOL.md
+*.md
